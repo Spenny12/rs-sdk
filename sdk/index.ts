@@ -143,8 +143,11 @@ interface PendingAction {
  * sendAction converts these into failed ActionResults so a single dropped
  * action reports itself instead of killing the caller's script.
  */
+/** Max wait for a walkTo ack before the gateway link is treated as dead. Acks take 1-9 s. */
+const WALK_STALL_MS = 20_000;
+
 class ActionDispatchError extends Error {
-    constructor(message: string, readonly reason: 'timeout' | 'disconnected' | 'error') {
+    constructor(message: string, readonly reason: 'timeout' | 'disconnected' | 'error' | 'stalled') {
         super(message);
         // Own-property define rather than assignment: hosts that freeze
         // Error.prototype make the inherited `name` non-writable and a plain
@@ -197,6 +200,7 @@ export class BotSDK {
 
     // Reconnection state
     private connectionState: ConnectionState = 'disconnected';
+    private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
     private reconnectAttempt = 0;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private intentionalDisconnect = false;
@@ -311,6 +315,7 @@ export class BotSDK {
                 this.connectPromise = null;
                 this.ws = null;
                 this.authenticated = false;
+                if (this.keepaliveTimer) { clearInterval(this.keepaliveTimer); this.keepaliveTimer = null; }
 
                 for (const [actionId, pending] of this.pendingActions) {
                     clearTimeout(pending.timeout);
@@ -341,6 +346,13 @@ export class BotSDK {
                         this.ws?.removeEventListener('message', checkConnected);
                         this.reconnectAttempt = 0;
                         this.authenticated = true;
+                        // Protocol-level ping (Bun's WebSocket has one) keeps the outbound side
+                        // of the socket from going idle through the gateway's proxy.
+                        if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+                        this.keepaliveTimer = setInterval(() => {
+                            try { (this.ws as any)?.ping?.(); } catch {}
+                        }, 20_000);
+                        (this.keepaliveTimer as any).unref?.();
                         if (typeof msg.maxMessageLength === 'number' && msg.maxMessageLength > 0) {
                             this.serverMaxMessageLength = msg.maxMessageLength;
                         }
@@ -436,6 +448,7 @@ export class BotSDK {
     async disconnect(): Promise<void> {
         this.intentionalDisconnect = true;
 
+        if (this.keepaliveTimer) { clearInterval(this.keepaliveTimer); this.keepaliveTimer = null; }
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
@@ -1090,6 +1103,24 @@ export class BotSDK {
 
                 this.pendingActions.set(actionId, { resolve, reject, timeout });
 
+                // A walk is acked in 1-9 s on the hosted gateway. After idle time the
+                // outbound side of this socket can go silently dead: state keeps
+                // arriving, but commands vanish and every walk hangs until its 60 s
+                // timeout (seen repeatedly; a fresh connection fixed it at once). So
+                // a walk with no ack in WALK_STALL_MS means a dead link: drop the
+                // socket (auto-reconnect follows) and fail fast so the caller retries.
+                const stallTimer = action.type === 'walkTo'
+                    ? setTimeout(() => {
+                        const pending = this.pendingActions.get(actionId);
+                        if (!pending) return;
+                        this.pendingActions.delete(actionId);
+                        clearTimeout(pending.timeout);
+                        console.warn(`[BotSDK] No ack for walkTo in ${WALK_STALL_MS}ms - gateway link looks dead, reconnecting`);
+                        try { this.ws?.close(); } catch {}
+                        reject(new ActionDispatchError(`No ack for walkTo in ${WALK_STALL_MS}ms; reconnecting`, 'stalled'));
+                    }, WALK_STALL_MS)
+                    : null;
+
                 try {
                     this.send({
                         type: 'sdk_action',
@@ -1103,6 +1134,7 @@ export class BotSDK {
                 }
                 return () => {
                     clearTimeout(timeout);
+                    if (stallTimer) clearTimeout(stallTimer);
                     this.pendingActions.delete(actionId);
                 };
             });

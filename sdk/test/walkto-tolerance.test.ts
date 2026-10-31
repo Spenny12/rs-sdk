@@ -36,8 +36,17 @@ describe('walkTo tolerance', () => {
         const r = await bot.walkTo(3210, 3200, 0);
         expect(r.success).toBe(true);
         expect(pos()).toEqual({ x: 3210, z: 3200 });
-        // Intermediate waypoint keeps the loose 2-tile pass; the final one uses the caller's 0.
-        expect(steps).toEqual([2, 0]);
+        // Waypoints 5 tiles apart merge into one lookahead hop, which is the final one.
+        expect(steps).toEqual([0]);
+    });
+
+    test('far waypoints stay separate hops: loose early return, exact final', async () => {
+        const { sdk, bot, steps, pos } = makeBot({ x: 3200, z: 3200 });
+        (sdk as any).sendFindPath = async () => ({ success: true, reachedDestination: true, waypoints: [{ x: 3250, z: 3200 }, { x: 3300, z: 3200 }] });
+        const r = await bot.walkTo(3300, 3200, 0);
+        expect(r.success).toBe(true);
+        expect(pos()).toEqual({ x: 3300, z: 3200 });
+        expect(steps).toEqual([16, 0]); // default chain lead is 16 tiles at a 3000 ms ack estimate
     });
 
     test('tolerance 1 accepts a diagonally adjacent tile', async () => {

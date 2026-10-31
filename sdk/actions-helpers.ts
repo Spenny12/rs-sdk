@@ -383,9 +383,13 @@ export class ActionHelpers {
         targetX: number,
         targetZ: number,
         tolerance: number,
-        lastPos: { x: number; z: number }
+        lastPos: { x: number; z: number },
+        chain: boolean = false
     ): Promise<{ status: 'arrived' | 'progress' | 'stuck'; pos: { x: number; z: number } }> {
+        if (chain) return this.walkStepChained(targetX, targetZ, tolerance, lastPos);
+        const sentAt = Date.now();
         const dispatch = await this.sdk.sendWalk(targetX, targetZ, true);
+        this.noteWalkAck(Date.now() - sentAt);
         if (!dispatch.success) return { status: 'stuck', pos: lastPos };
         const moveResult = await this.waitForMovementComplete(targetX, targetZ, tolerance);
 
@@ -411,6 +415,83 @@ export class ActionHelpers {
         }
 
         return { status: 'progress', pos: currentPos };
+    }
+
+    // ============ Chained Walking ============
+
+    /** Smoothed round-trip time of a walk command, ms. Starts at a typical gateway value. */
+    private walkAckMs = 3000;
+
+    private noteWalkAck(ms: number): void {
+        this.walkAckMs = Math.round(this.walkAckMs * 0.6 + Math.min(ms, 15_000) * 0.4);
+    }
+
+    /**
+     * How many tiles before the end of a hop the next command must go out so the
+     * bot never stops: the command needs about half the ack round trip to reach the
+     * game client, and the bot runs 2 tiles per ~400 ms tick. Plus a safety margin.
+     */
+    chainLeadTiles(): number {
+        return Math.max(8, Math.min(36, Math.ceil(this.walkAckMs / 400) + 8));
+    }
+
+    /**
+     * Chained walk step, like a player clicking the next tile while still running to
+     * the last one. The command is sent WITHOUT waiting for its ack (the ack takes
+     * 1-9 s on the hosted gateway), then we watch the player's position. Returns as
+     * soon as the player is within `leadTiles` of the target, so the caller can send
+     * the next hop before this one ends. `stuck` means the dispatch failed, or the
+     * player did not move for 4 ticks after the ack, or the hop took far too long.
+     */
+    private async walkStepChained(
+        targetX: number,
+        targetZ: number,
+        leadTiles: number,
+        lastPos: { x: number; z: number }
+    ): Promise<{ status: 'arrived' | 'progress' | 'stuck'; pos: { x: number; z: number } }> {
+        const sentAt = Date.now();
+        let ackOk: boolean | null = null;
+        let ackTick = -1;
+        this.sdk.sendWalk(targetX, targetZ, true).then(
+            r => { ackOk = r.success; ackTick = this.sdk.getState()?.tick ?? -1; this.noteWalkAck(Date.now() - sentAt); },
+            () => { ackOk = false; }
+        );
+
+        const start = this.sdk.getState()?.player;
+        let lastX = start?.worldX ?? lastPos.x;
+        let lastZ = start?.worldZ ?? lastPos.z;
+        let lastMoveTick = this.sdk.getState()?.tick ?? 0;
+        const hopTiles = this.distance(lastX, lastZ, targetX, targetZ);
+        // Generous: ack latency plus the time to run the hop at 1 tile/tick.
+        const deadline = sentAt + 20_000 + hopTiles * 600;
+
+        for (;;) {
+            if (ackOk === false) {
+                return { status: 'stuck', pos: { x: lastX, z: lastZ } };
+            }
+            let state: BotWorldState;
+            try { state = await this.sdk.waitForTicks(1); }
+            catch { return { status: 'stuck', pos: { x: lastX, z: lastZ } }; }
+            const p = state.player;
+            if (!p) return { status: 'stuck', pos: { x: lastX, z: lastZ } };
+
+            if (p.worldX !== lastX || p.worldZ !== lastZ) {
+                lastMoveTick = state.tick;
+                lastX = p.worldX;
+                lastZ = p.worldZ;
+            }
+            const pos = { x: p.worldX, z: p.worldZ };
+            if (this.distance(pos.x, pos.z, targetX, targetZ) <= leadTiles) {
+                return { status: 'arrived', pos };
+            }
+            // Only judge "not moving" once the command has been acked and had 4 ticks to act.
+            if (ackOk === true && state.tick - Math.max(lastMoveTick, ackTick) >= 4) {
+                return { status: 'stuck', pos };
+            }
+            if (Date.now() > deadline) {
+                return { status: 'progress', pos };
+            }
+        }
     }
 
     /**
