@@ -1125,6 +1125,12 @@ export class BotActions {
         }
 
         const MAX_ITERATIONS = 50;
+        // The hosted gateway answers each command in ~1-9 s (a status GET alone
+        // takes 1.5-3.4 s), longer than the bot needs to run a short hop. So a
+        // hop must cover more ground than one ack delay: 40 tiles = 20 ticks of
+        // running. If the client cannot route a long hop, fall back to 12.
+        // Declared outside the re-query loop so the fallback sticks.
+        let walkLookahead = 40;
         const MAX_DOOR_RETRIES = 3;
         let doorRetryCount = 0;
         let poorProgressCount = 0;
@@ -1220,7 +1226,35 @@ export class BotActions {
             // Walk waypoints
             let consecutiveStuck = 0;
 
-            for (const wp of path.waypoints) {
+            // The pathfinder returns corner waypoints, often 1-2 tiles apart. Walking
+            // them one at a time costs 2-13 idle ticks per waypoint (send, wait for a
+            // full stop, repeat): a 35-tile walk took 148 ticks instead of ~18. So
+            // aim at the farthest waypoint within walkLookahead tiles of path and
+            // let the client route the hop. Waypoints near a door stay
+            // single-stepped so the proactive door opening below still fires.
+            const nearRequiredDoor = (w: { x: number; z: number }) => requiredDoorKeys.size > 0 && (
+                requiredDoorKeys.has(`${w.x},${w.z}`) ||
+                requiredDoorKeys.has(`${w.x + 1},${w.z}`) ||
+                requiredDoorKeys.has(`${w.x - 1},${w.z}`) ||
+                requiredDoorKeys.has(`${w.x},${w.z + 1}`) ||
+                requiredDoorKeys.has(`${w.x},${w.z - 1}`));
+            const wps = path.waypoints;
+            let wpIdx = 0;
+            while (wpIdx < wps.length) {
+                let ahead = wpIdx;
+                if (!nearRequiredDoor(wps[wpIdx]!)) {
+                    let acc = 0;
+                    while (ahead + 1 < wps.length && !nearRequiredDoor(wps[ahead + 1]!)) {
+                        const cur = wps[ahead]!;
+                        const next = wps[ahead + 1]!;
+                        const hop = this.helpers.distance(cur.x, cur.z, next.x, next.z);
+                        if (acc + hop > walkLookahead) break;
+                        acc += hop;
+                        ahead++;
+                    }
+                }
+                const wp = wps[ahead]!;
+                wpIdx = ahead + 1;
                 const stale = await ensureFreshState();
                 if (stale) return stale;
                 // Proactively open doors the path requires — only when we're close enough to see them
@@ -1286,14 +1320,22 @@ export class BotActions {
                 // "arrived" up to 2 tiles short, the outer check kept failing,
                 // and walkTo ended in "Stuck at" on open ground.
                 const isFinalWp = wp === path.waypoints[path.waypoints.length - 1];
-                const wpTolerance = isFinalWp ? Math.min(2, tolerance) : 2;
-                const result = await this.helpers.walkStepToward(wp.x, wp.z, wpTolerance, pos);
+                // Chained hops: send the command without waiting for its ack and return
+                // while still running, `chainLeadTiles` before the end of the hop, so the
+                // next command lands before the bot would stop (like a player clicking the
+                // next tile mid-run). The final hop and hops at doors are not chained:
+                // they must arrive.
+                const chainThis = !isFinalWp && !nearRequiredDoor(wp);
+                const wpTolerance = isFinalWp ? Math.min(2, tolerance) : chainThis ? this.helpers.chainLeadTiles() : 2;
+                const result = await this.helpers.walkStepToward(wp.x, wp.z, wpTolerance, pos, chainThis);
                 pos = result.pos;
                 const deadMidStep = diedEnRoute();
                 if (deadMidStep) return deadMidStep;
                 if (distTo(result.pos) <= tolerance) return { success: true, message: 'Arrived' };
 
                 if (result.status === 'stuck') {
+                    // A long hop the client could not route: retry with short hops.
+                    if (walkLookahead > 12) { walkLookahead = 12; break; }
                     if (++consecutiveStuck >= 3) {
                         await tryOpenDoor();
                         break; // Re-query path

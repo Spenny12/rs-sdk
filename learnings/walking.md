@@ -163,3 +163,65 @@ function isInAlKharid() {
     return player.worldX >= 3267 && player.worldZ < 3220;
 }
 ```
+
+## Walking speed (priority: movement speed)
+
+**Measured 2026-10-31 (Spencebot, Lumbridge):** a 35-tile `walkTo` took 148 ticks
+(~59 s) instead of ~18 ticks. The tick was ~400 ms, and only 33 of 166 state
+updates showed movement. Run energy was 100, so running was not the limit.
+
+**Cause:** `findPath` returns *corner* waypoints, often 1-2 tiles apart (16
+waypoints for 35 tiles). `walkTo` sent one `sendWalk` per waypoint, then waited
+for a full stop before the next. Each waypoint cost 2-13 idle ticks.
+
+**Root cause 2 (bigger): gateway latency.** The hosted gateway
+(`rs-sdk-demo.fly.dev`) takes 1-9 s to ack each `sendWalk`. A plain
+`curl .../status/<bot>` takes 1.5-3.4 s (connect is only 24 ms). The bot reaches the
+end of a short hop during that wait and stands idle. Fewer, longer commands win.
+
+**Fix (sdk/actions.ts, `_walkToRoute`):**
+- Look ahead: aim at the farthest waypoint within `walkLookahead` (40) tiles of
+  path. The client routes the hop. If a hop fails to dispatch, it falls back to 12.
+- Intermediate hops return 16 tiles early (8 ticks of running), so the next command
+  is acked before the bot stops.
+- Waypoints near a required door stay single-stepped. Door opening still runs there.
+- Tests: `sdk/test/walkto-tolerance.test.ts`.
+- **Result:** 35 tiles went from ~148 ticks / 53-61 s to 69 ticks / 28 s.
+
+**Use the lite client, not the browser.** The browser client drives its action loop
+from the draw loop. A hidden tab throttles it (acks of seconds, hangs of minutes).
+Start `cd server/webclient && bun install && bun src/lite/runner.ts <bot>` first.
+The MCP then logs "Active client detected, skipping browser launch".
+
+**Chained walking (implemented, shared server):** like a player clicking the next
+tile while still running. `walkStepToward(..., chain=true)` in `sdk/actions-helpers.ts`
+sends the walk command WITHOUT awaiting its ack, then watches position. It returns
+`chainLeadTiles()` tiles before the hop ends (ack EWMA / 400 ms + 8, clamped 8-36), so the
+next command lands before the bot stops. The final hop and hops near doors are not
+chained (they must arrive). A failed dispatch or 4 ticks without movement after the ack
+returns `stuck`, and `_walkToRoute` falls back to 12-tile hops.
+**Result on the shared server:** 58 tiles in 64 ticks / 26 s (ideal 29 ticks); the
+first command still pays ~2-4 s of gateway latency. Baseline was ~148 ticks per 35 tiles.
+
+**Stale SDK link (found 2026-10-31):** after a few idle minutes the SDK's gateway socket
+stops delivering commands. State keeps arriving, but every `sendWalk` hangs until its
+60 s timeout (walks showed 0 movement and 0 acks). `disconnect_bot` then a new
+`execute_code` fixed it at once, and restarting the lite client did not. Fix in
+`sdk/index.ts`: a 20 s ack watchdog on `walkTo` (`WALK_STALL_MS`) closes the socket and
+fails fast with reason `stalled`, and a 20 s protocol ping keeps the socket busy.
+If walks hang anyway: `disconnect_bot`, then retry.
+
+**Ideas not done yet:**
+- Local server (`bun bots/create-bot.ts <name> --local`): near-zero latency, but a new
+  private world. The user wants the shared server, so do not move Spencebot.
+- Chain non-walk actions (door opens, interactions) the same way.
+
+**To measure walking:** record `[tick, x, z]` on each `sdk.onStateUpdate`. Count
+ticks with no position change. Compare ticks used to `distance / 2`.
+
+**Other causes of slow trips (not fixed):**
+- A fight stalls `walkTo` (swamp spiders near Urhney). Retry the walk after.
+- The route between the chapel and the swamp goes west of the castle. Check the
+  waypoints with `sdk.sendFindPath(x, z, 500)` before long trips.
+- The MCP server loads `sdk/*.ts` once. After you edit the SDK, reconnect
+  `rs-agent` (`/mcp`) so the change takes effect.
