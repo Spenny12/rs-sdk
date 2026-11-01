@@ -217,3 +217,9 @@ Thieving requires no tools or equipment - making it ideal for:
 - Characters with no starting capital
 
 With Attack 70+ you could easily farm goblins for drops, but thieving works from level 1 with nothing in inventory.
+
+## Fast money route at 25x XP (Spencebot, 2026-11-01)
+Men at Lumbridge castle 1 -> 43 (8 min, ~300 gp). Ardougne market Guards 43 -> 55 (`^guard$`, ~35 gp each).
+Knights of Ardougne (`^knight of ardougne$`, level 55) -> 78 in 9 min, 4,450 gp (~500 gp/min).
+Stuns are frequent (~1 per success): bring ~20 food per 10 minutes. Script: bots/shared/thieve.ts
+(HP guard eats at 60%, stops when food is low).

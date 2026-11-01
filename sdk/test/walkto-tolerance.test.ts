@@ -19,14 +19,16 @@ function makeBot(start: { x: number; z: number }) {
     const bot = new BotActions(sdk);
     (bot as any).dismissBlockingUI = async () => {};
     const steps: number[] = [];
+    const reach: number[] = []; // distance from the bot to each hop target at dispatch
     (bot as any).helpers.walkStepToward = async (tx: number, tz: number, tolerance: number) => {
         steps.push(tolerance);
+        reach.push(Math.max(Math.abs(tx - pos.x), Math.abs(tz - pos.z)));
         // The stepper stops as soon as it is within its tolerance, like the real one.
         const dx = Math.sign(tx - pos.x), dz = Math.sign(tz - pos.z);
         while (Math.max(Math.abs(tx - pos.x), Math.abs(tz - pos.z)) > tolerance) pos = { x: pos.x + dx, z: pos.z + dz };
         return { status: 'arrived' as const, pos: { ...pos } };
     };
-    return { sdk, bot, steps, pos: () => pos };
+    return { sdk, bot, steps, reach, pos: () => pos };
 }
 
 describe('walkTo tolerance', () => {
@@ -40,13 +42,19 @@ describe('walkTo tolerance', () => {
         expect(steps).toEqual([0]);
     });
 
-    test('far waypoints stay separate hops: loose early return, exact final', async () => {
-        const { sdk, bot, steps, pos } = makeBot({ x: 3200, z: 3200 });
+    test('long segments split into hops within reach: chained early return, exact final', async () => {
+        const { sdk, bot, steps, reach, pos } = makeBot({ x: 3200, z: 3200 });
         (sdk as any).sendFindPath = async () => ({ success: true, reachedDestination: true, waypoints: [{ x: 3250, z: 3200 }, { x: 3300, z: 3200 }] });
         const r = await bot.walkTo(3300, 3200, 0);
         expect(r.success).toBe(true);
         expect(pos()).toEqual({ x: 3300, z: 3200 });
-        expect(steps).toEqual([16, 0]); // default chain lead is 16 tiles at a 3000 ms ack estimate
+        // Every target stays within the 30-tile hop radius of the bot.
+        expect(Math.max(...reach)).toBeLessThanOrEqual(30);
+        // Intermediate hops return at the chain lead (16 tiles at the 3000 ms ack
+        // estimate); only the final hop must land exactly.
+        expect(steps.slice(0, -1).every(t => t === 16)).toBe(true);
+        expect(steps[steps.length - 1]).toBe(0);
+        expect(steps.length).toBeGreaterThan(2);
     });
 
     test('tolerance 1 accepts a diagonally adjacent tile', async () => {

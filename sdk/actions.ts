@@ -1131,6 +1131,9 @@ export class BotActions {
         // running. If the client cannot route a long hop, fall back to 12.
         // Declared outside the re-query loop so the fallback sticks.
         let walkLookahead = 40;
+        // Max Chebyshev distance from the bot's live position to a hop target the
+        // client is asked to route.
+        const WALK_HOP_RADIUS = 30;
         const MAX_DOOR_RETRIES = 3;
         let doorRetryCount = 0;
         let poorProgressCount = 0;
@@ -1241,6 +1244,13 @@ export class BotActions {
             const wps = path.waypoints;
             let wpIdx = 0;
             while (wpIdx < wps.length) {
+                // A chained hop is sent while the bot is still short of the last one,
+                // so measure reach from where the bot IS. Targets far from the bot
+                // were rejected by the client router (4 of 19 hops on a Lumbridge to
+                // Varrock walk, costing a 50-tick stall).
+                const here = this.sdk.getState()?.player;
+                const hx = here?.worldX ?? pos.x;
+                const hz = here?.worldZ ?? pos.z;
                 let ahead = wpIdx;
                 if (!nearRequiredDoor(wps[wpIdx]!)) {
                     let acc = 0;
@@ -1249,12 +1259,32 @@ export class BotActions {
                         const next = wps[ahead + 1]!;
                         const hop = this.helpers.distance(cur.x, cur.z, next.x, next.z);
                         if (acc + hop > walkLookahead) break;
+                        if (this.helpers.distance(hx, hz, next.x, next.z) > WALK_HOP_RADIUS) break;
                         acc += hop;
                         ahead++;
                     }
                 }
-                const wp = wps[ahead]!;
+                let wp = wps[ahead]!;
                 wpIdx = ahead + 1;
+                // One long straight segment can still end beyond reach. Corner
+                // waypoints mean each segment runs in one fixed direction, so any tile
+                // on it is on the path: aim at the farthest one within reach and keep
+                // this waypoint for the next hop.
+                if (this.helpers.distance(hx, hz, wp.x, wp.z) > WALK_HOP_RADIUS && !nearRequiredDoor(wp)) {
+                    const prev = ahead > 0 ? wps[ahead - 1]! : { x: hx, z: hz };
+                    const sx = Math.sign(wp.x - prev.x);
+                    const sz = Math.sign(wp.z - prev.z);
+                    let px = prev.x, pz = prev.z;
+                    while ((px !== wp.x || pz !== wp.z)
+                        && this.helpers.distance(hx, hz, px + sx, pz + sz) <= WALK_HOP_RADIUS) {
+                        px += sx;
+                        pz += sz;
+                    }
+                    if (px !== prev.x || pz !== prev.z) {
+                        wp = { x: px, z: pz, level: wp.level };
+                        wpIdx = ahead;
+                    }
+                }
                 const stale = await ensureFreshState();
                 if (stale) return stale;
                 // Proactively open doors the path requires — only when we're close enough to see them
@@ -1320,14 +1350,15 @@ export class BotActions {
                 // "arrived" up to 2 tiles short, the outer check kept failing,
                 // and walkTo ended in "Stuck at" on open ground.
                 const isFinalWp = wp === path.waypoints[path.waypoints.length - 1];
-                // Chained hops: send the command without waiting for its ack and return
-                // while still running, `chainLeadTiles` before the end of the hop, so the
-                // next command lands before the bot would stop (like a player clicking the
-                // next tile mid-run). The final hop and hops at doors are not chained:
-                // they must arrive.
-                const chainThis = !isFinalWp && !nearRequiredDoor(wp);
-                const wpTolerance = isFinalWp ? Math.min(2, tolerance) : chainThis ? this.helpers.chainLeadTiles() : 2;
-                const result = await this.helpers.walkStepToward(wp.x, wp.z, wpTolerance, pos, chainThis);
+                // Every hop is chained: sent without waiting for its ack, finished by
+                // watching position. Intermediate hops return `chainLeadTiles` early so
+                // the next command lands before the bot would stop (like a player clicking
+                // the next tile mid-run). The final hop and hops at doors must arrive, so
+                // they wait until within 2 tiles - but still not for the ack, which took
+                // ~4.5 s (11 idle ticks) after the bot had already arrived.
+                const mustArrive = isFinalWp || nearRequiredDoor(wp);
+                const wpTolerance = isFinalWp ? Math.min(2, tolerance) : mustArrive ? 2 : this.helpers.chainLeadTiles();
+                const result = await this.helpers.walkStepToward(wp.x, wp.z, wpTolerance, pos, true);
                 pos = result.pos;
                 const deadMidStep = diedEnRoute();
                 if (deadMidStep) return deadMidStep;

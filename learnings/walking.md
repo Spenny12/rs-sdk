@@ -196,20 +196,26 @@ The MCP then logs "Active client detected, skipping browser launch".
 **Chained walking (implemented, shared server):** like a player clicking the next
 tile while still running. `walkStepToward(..., chain=true)` in `sdk/actions-helpers.ts`
 sends the walk command WITHOUT awaiting its ack, then watches position. It returns
-`chainLeadTiles()` tiles before the hop ends (ack EWMA / 400 ms + 8, clamped 8-36), so the
-next command lands before the bot stops. The final hop and hops near doors are not
-chained (they must arrive). A failed dispatch or 4 ticks without movement after the ack
+`chainLeadTiles()` tiles before the hop ends (ack EWMA / 400 ms + 8, clamped 8-22), so the
+next command lands before the bot stops. The final hop and hops near doors are also
+position-based but wait until within 2 tiles (no ack wait: acks took 4.5-10 s after arrival).
+Hop targets stay within 30 tiles (`WALK_HOP_RADIUS`) of the bot's live position; long
+straight segments are split, because far targets were rejected by the client router. A failed dispatch or 4 ticks without movement after the ack
 returns `stuck`, and `_walkToRoute` falls back to 12-tile hops.
 **Result on the shared server:** 58 tiles in 64 ticks / 26 s (ideal 29 ticks); the
 first command still pays ~2-4 s of gateway latency. Baseline was ~148 ticks per 35 tiles.
 
-**Stale SDK link (found 2026-10-31):** after a few idle minutes the SDK's gateway socket
-stops delivering commands. State keeps arriving, but every `sendWalk` hangs until its
-60 s timeout (walks showed 0 movement and 0 acks). `disconnect_bot` then a new
-`execute_code` fixed it at once, and restarting the lite client did not. Fix in
-`sdk/index.ts`: a 20 s ack watchdog on `walkTo` (`WALK_STALL_MS`) closes the socket and
-fails fast with reason `stalled`, and a 20 s protocol ping keeps the socket busy.
-If walks hang anyway: `disconnect_bot`, then retry.
+**Hangs after "instrumenting" sdk methods (root cause found 2026-11-01):** in MCP
+`execute_code`, `sdk` and `bot` are per-execution proxies. Their methods are bound to
+that execution and, once it ends, they park forever (by design, so cancelled code
+cannot spin). Code like `const orig = sdk.sendWalk; sdk.sendWalk = wrap; ...;
+sdk.sendWalk = orig` writes the proxy's execution-bound wrapper onto the real SDK
+object. Every later call from every later run then parks silently: no packet, no
+`pendingActions` entry, no timeout. It looked like a dead gateway link.
+`disconnect_bot` or restarting the MCP server "fixed" it only because they build a
+fresh SDK object. To wrap a method: call `Object.getPrototypeOf(sdk).method` inside the
+wrapper, and on exit `delete sdk.method` (see `bots/shared/travel.ts`).
+An ack watchdog built on the wrong diagnosis was reverted.
 
 **Ideas not done yet:**
 - Local server (`bun bots/create-bot.ts <name> --local`): near-zero latency, but a new

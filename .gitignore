@@ -37,3 +37,6 @@ server/engine/data/market.sqlite*
 
 # Dashboard state is live host data, not source.
 /dashboard-max/data/
+
+# Shared bot scripts (helpers, trainers, quest scripts) are tracked
+!bots/shared/

@@ -430,9 +430,10 @@ export class ActionHelpers {
      * How many tiles before the end of a hop the next command must go out so the
      * bot never stops: the command needs about half the ack round trip to reach the
      * game client, and the bot runs 2 tiles per ~400 ms tick. Plus a safety margin.
+     * Capped below walkTo's 30-tile hop radius so the next target stays routable.
      */
     chainLeadTiles(): number {
-        return Math.max(8, Math.min(36, Math.ceil(this.walkAckMs / 400) + 8));
+        return Math.max(8, Math.min(22, Math.ceil(this.walkAckMs / 400) + 8));
     }
 
     /**
