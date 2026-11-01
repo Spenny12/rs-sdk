@@ -204,3 +204,11 @@ console.log(`Training ${stat} with ${style.name}`);
 ```
 
 This pattern enabled balanced 60+ in all melee stats.
+
+
+## Al Kharid warriors are multi-combat (2026-11-01)
+With Defence 1, several warriors attack at once. Spencebot (HP 44, Strength style, bronze sword) ate 12 kebabs in
+~4 minutes and reached 1 HP before it could walk away. Stop training while food is still left (`minFood` in
+bots/shared/train.ts), and prefer single-combat targets (cows) while Defence is low. Kebab seller (3273, 3180):
+NPC name `Kebab seller`, dialog "Yes please." = 1 kebab for 1 gp. Zeke stocks only ONE mithril scimitar (restock rate
+4000); it is often bought out. Iron 112, steel 400, mithril 1040 gp.
